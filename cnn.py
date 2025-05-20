@@ -3,22 +3,43 @@ import jax.numpy as jnp
 from jax import random, jit
 from functools import partial
 from data_utils import load_mnist
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, NamedTuple
+import tqdm
 
 
-def init_cnn_params(key: jax.Array) -> Dict[str, Any]:
+class BatchNormState(NamedTuple):
   """
-  Initialize model parameters for:
-  - 4 convolutional layers (conv1, conv2, conv3, conv4)
-  - 2 batch normalization layers (bn1, bn2)
-  - 1 fully connected layer (fc)
+  Track running stats for batch normalization.
+  """
 
-  Args:
-    key: JAX random key
+  mean1: jax.Array  # running mean for first batchnorm layer
+  var1: jax.Array  # running variance for first batchnorm layer
+  mean2: jax.Array  # running mean for second batchnorm layer
+  var2: jax.Array  # running variance for second batchnorm layer
+
+
+class ModelParams(NamedTuple):
+  """
+  Contains all trainable parameters of the model.
+  """
+
+  conv1: Tuple[jax.Array, jax.Array]  # (weights, bias)
+  conv2: Tuple[jax.Array, jax.Array]  # (weights, bias)
+  conv3: Tuple[jax.Array, jax.Array]  # (weights, bias)
+  conv4: Tuple[jax.Array, jax.Array]  # (weights, bias)
+  bn1: Tuple[jax.Array, jax.Array]  # (gamma, beta)
+  bn2: Tuple[jax.Array, jax.Array]  # (gamma, beta)
+  fc: Tuple[jax.Array, jax.Array]  # (weights, bias)
+
+
+def init_cnn_params() -> Tuple[ModelParams, BatchNormState]:
+  """
+  Initialize model parameters and batch normalization state.
 
   Returns:
-    Dictionary containing parameters for each layer.
+    A tuple of (trainable_parameters, batch norm state).
   """
+  key = jax.random.PRNGKey(0)
   keys = random.split(key, 5)
   params = {}
 
@@ -255,7 +276,9 @@ def forward(
 
 
 @jit
-def loss(params: Dict[str, Any], x: jax.Array, y_onehot: jax.Array) -> jax.Array:
+def loss(
+  params: Dict[str, Any], x: jax.Array, y_onehot: jax.Array
+) -> Tuple[jax.Array, jax.Array]:
   """
   Cross entropy-loss function using log-probabilities from forward pass.
 
@@ -265,11 +288,60 @@ def loss(params: Dict[str, Any], x: jax.Array, y_onehot: jax.Array) -> jax.Array
     y_onehot: One-hot encoded labels for the input data.
 
   Returns:
-    A JAX Array containing a scalar value of the average loss across a batch.
+    A Tuple containing a JAX Array of the cross entropy loss for a batch as well as a dictionary of the updated parameters.
   """
-  log_probs, new_params = forward(params, x, is_training=True)
+  logits, new_params = forward(params, x, is_training=True)
+  log_probs = jax.nn.log_softmax(logits)
   cross_entropy_loss = -jnp.mean(jnp.sum(log_probs * y_onehot, axis=-1))
-  return cross_entropy_loss
+  return cross_entropy_loss, new_params
+
+
+@jit
+def train_step(
+  params: Dict[str, Any], x: jax.Array, y: jax.Array, lr: float
+) -> Tuple[Dict[str, Any], jax.Array]:
+  """
+  Perform a single training step.
+
+  Args:
+    params: Dictionary of model parameters.
+    x: Input data [BS x 28 x 28 x 1] in NHWC format or [BS x 784] flattened.
+    y: Labels for the input data.
+    lr: Learning rate.
+
+  Returns:
+    A Tuple containing a dictionary of the new parameters and a JAX Array containing the loss value.
+  """
+  y_onehot = jax.nn.one_hot(y, num_classes=10)
+
+  # custom loss function that properly handles batch norm updates
+  def loss_fn(p: Dict[str, Any]) -> Tuple[jax.Array, Dict[str, Any]]:
+    logits, new_p = forward(p, x, is_training=True)
+    log_probs = jax.nn.log_softmax(logits)
+    loss_val = -jnp.mean(jnp.sum(log_probs * y_onehot, axis=-1))
+    return loss_val, new_p
+
+  # custom loss function that separates parameter updates from differentiation
+  def loss_value_grad(p: Dict[str, Any]) -> Tuple[jax.Array, Dict[str, Any], Any]:
+    (loss_val, new_p), grad_fn = jax.vjp(lambda p: loss_fn(p)[0], p)
+    grads = grad_fn(jnp.ones_like(loss_val))[0]
+    return loss_val, new_p, grads
+
+  # compute loss, updated parameters, and gradients
+  loss_val, new_params, grads = loss_value_grad(params)
+
+  # perform SGD step
+  updated_params = {}
+  for k in params.keys():
+    # keep the updated batch norm stats
+    if k.startswith("bn"):
+      updated_params[k] = new_params[k]
+    else:
+      # update weights and biases with gradient descent
+      updated_params[k] = jax.tree_util.tree_map(
+        lambda p, g: p - lr * g, params[k], grads[k]
+      )
+  return updated_params, loss_val
 
 
 @jit
@@ -285,39 +357,10 @@ def accuracy(params: Dict[str, Any], x: jax.Array, y: jax.Array) -> jax.Array:
   Returns:
     A JAX Array containing a scalar value of the average accuracy across a batch.
   """
-  log_probs = forward(params, x, is_training=False)
-  preds = jnp.argmax(log_probs, axis=-1)
+  logits, _ = forward(params, x, is_training=False)
+  preds = jnp.argmax(logits, axis=-1)
   acc = jnp.mean(preds == y)
   return acc
-
-
-@jit
-def update():
-  """
-  TODO:
-  Perform one SGD update step.
-  """
-
-
-@jit
-def train_step(
-  params: Dict[str, Any], x: jax.Array, y: jax.Array, lr: float
-) -> Tuple[Dict[str, Any], jax.Array]:
-  """
-  Perform a single training step.
-
-  Args:
-    params: Dictionary of model parameters.
-    x: Input data [BS x 28 x 28 x 1] in NHWC format or [BS x 784] flattened.
-    y: Labels for the input data.
-
-  Returns:
-    A Tuple containing a dictionary of the new parameters and a JAX Array containing the loss value.
-  """
-  loss_val, grads = jax.value_and_grad(loss)(params, x, y)
-  # SGD update
-  new_params = jax.tree_util.tree_map(lambda p, g: p - lr * g, params, grads)
-  return new_params, loss_val
 
 
 # program entry point
@@ -326,25 +369,49 @@ if __name__ == "__main__":
   X_train, Y_train, X_test, Y_test = load_mnist("./mnist")
 
   # hyperparameters
+  learning_rate = 1e-2
+  num_epochs = 50
   batch_size = 64
 
   # initialize model parameters
   key = jax.random.PRNGKey(0)
   params = init_cnn_params(key)
 
-  # create one-hot encodings for labels
-  num_classes = 10
-  Y_train_onehot = jax.nn.one_hot(Y_train, num_classes)
-
   # number of batches
   num_train = X_train.shape[0]
   num_batches = num_train // batch_size
 
-  # single forward pass
-  X_batch = X_train[:batch_size]
-  y, new_params = forward(params, X_batch, is_training=True)
+  # training loop
+  for epoch in range(num_epochs):
+    # shuffle training data
+    key, subkey = random.split(key)
+    perm = random.permutation(subkey, num_train)
+    X_train_shuffled = X_train[perm]
+    Y_train_shuffled = Y_train[perm]
 
-  print(f"Forward pass input: {X_batch.shape}, {X_batch.dtype}")
-  print(f"Forward pass output: {y.shape}, {y.dtype}")
+    # mini-batch training
+    epoch_loss = 0.0
+    for batch in tqdm.trange(num_batches, desc=f"Epoch {epoch + 1}/{num_epochs}"):
+      start_idx = batch * batch_size
+      end_idx = start_idx + batch_size
+      X_batch = X_train_shuffled[start_idx:end_idx]
+      Y_batch = Y_train_shuffled[start_idx:end_idx]
 
-  print("CNN is complete.")
+      # training step: update parameters and computer batch loss
+      params, batch_loss = train_step(params, X_batch, Y_batch, learning_rate)
+      epoch_loss += batch_loss / num_batches
+
+    # end-of-epoch valuation
+    train_accuracy = accuracy(params, X_train, Y_train)
+    test_accuracy = accuracy(params, X_test, Y_test)
+
+    print(
+      f"Train Loss: {epoch_loss:.4f}, "
+      f"Train Accuracy: {train_accuracy * 100:.2f}%, "
+      f"Test Accuracy: {test_accuracy * 100:.2f}%\n"
+    )
+
+  # final test set evaluation
+  final_test_accuracy = accuracy(params, X_test, Y_test)
+  print("\nTraining complete!")
+  print(f"Final Test Accuracy: {final_test_accuracy * 100:.2f}%")
