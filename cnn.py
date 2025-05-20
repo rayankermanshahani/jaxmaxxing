@@ -32,7 +32,7 @@ class ModelParams(NamedTuple):
   fc: Tuple[jax.Array, jax.Array]  # (weights, bias)
 
 
-def init_cnn_params() -> Tuple[ModelParams, BatchNormState]:
+def init_model() -> Tuple[ModelParams, BatchNormState]:
   """
   Initialize model parameters and batch normalization state.
 
@@ -48,7 +48,7 @@ def init_cnn_params() -> Tuple[ModelParams, BatchNormState]:
   out_channels = 32
   kernel_size = 5
   stddev = jnp.sqrt(2.0 / (in_channels * kernel_size * kernel_size))
-  params["conv1"] = (
+  conv1 = (
     random.normal(keys[0], (out_channels, in_channels, kernel_size, kernel_size))
     * stddev,
     jnp.zeros((out_channels,)),
@@ -59,7 +59,7 @@ def init_cnn_params() -> Tuple[ModelParams, BatchNormState]:
   out_channels = 32
   kernel_size = 5
   stddev = jnp.sqrt(2.0 / (in_channels * kernel_size * kernel_size))
-  params["conv2"] = (
+  conv2 = (
     random.normal(keys[1], (out_channels, in_channels, kernel_size, kernel_size))
     * stddev,
     jnp.zeros((out_channels,)),
@@ -70,7 +70,7 @@ def init_cnn_params() -> Tuple[ModelParams, BatchNormState]:
   out_channels = 64
   kernel_size = 3
   stddev = jnp.sqrt(2.0 / (in_channels * kernel_size * kernel_size))
-  params["conv3"] = (
+  conv3 = (
     random.normal(keys[2], (out_channels, in_channels, kernel_size, kernel_size))
     * stddev,
     jnp.zeros((out_channels,)),
@@ -81,7 +81,7 @@ def init_cnn_params() -> Tuple[ModelParams, BatchNormState]:
   out_channels = 64
   kernel_size = 3
   stddev = jnp.sqrt(2.0 / (in_channels * kernel_size * kernel_size))
-  params["conv4"] = (
+  conv4 = (
     random.normal(keys[3], (out_channels, in_channels, kernel_size, kernel_size))
     * stddev,
     jnp.zeros((out_channels,)),
@@ -89,58 +89,80 @@ def init_cnn_params() -> Tuple[ModelParams, BatchNormState]:
 
   # first batch normalization: channels=32
   channels = 32
-  params["bn1"] = (
+  bn1 = (
     jnp.ones((channels,)),  # scale (gamma)
     jnp.zeros((channels,)),  # bias (beta)
-    jnp.zeros((channels,)),  # running mean (for inference)
-    jnp.ones((channels,)),  # running variance (for inference)
   )
 
   # second batch normalization: channels=64
   channels = 64
-  params["bn2"] = (
+  bn2 = (
     jnp.ones((channels,)),  # scale (gamma)
     jnp.zeros((channels,)),  # bias (beta)
-    jnp.zeros((channels,)),  # running mean (for inference)
-    jnp.ones((channels,)),  # running variance (for inference)
   )
 
   # fully-connected: in=576, out=10 (576 = 64 channels * 3 * 3 spatial dimensions after pooling)
   in_features = 576
   out_features = 10
   stddev = jnp.sqrt(2.0 / in_features)
-  params["fc"] = (
+  fc = (
     random.normal(keys[4], (out_features, in_features)) * stddev,
     jnp.zeros((out_features,)),
   )
 
-  return params
+  # create model parameters
+  params = ModelParams(
+    conv1=conv1,
+    conv2=conv2,
+    conv3=conv3,
+    conv4=conv4,
+    bn1=bn1,
+    bn2=bn2,
+    fc=fc,
+  )
+
+  # create batch norm running stats
+  bn_state = BatchNormState(
+    mean1=jnp.zeros((32,)),
+    var1=jnp.zeros((32,)),
+    mean2=jnp.zeros((64,)),
+    var2=jnp.zeros((64,)),
+  )
+
+  return params, bn_state
 
 
-@partial(jit, static_argnums=(2,))
+@partial(jit, static_argnums=(3, 4))
 def forward(
-  params: Dict[str, Any], x: jax.Array, is_training: bool = False
-) -> Tuple[jax.Array, Dict[str, Any]]:
+  params: ModelParams,
+  bn_state: BatchNormState,
+  x: jax.Array,
+  is_training: bool = False,
+  momentum: float = 0.9,
+) -> Tuple[jax.Array, BatchNormState]:
   """
   Forward pass through the neural network.
 
   Args:
     params: Dictionary of model parameters.
-    x: Input data [BS x 28 x 28 x 1] in NHWC format or [BS x 784] flattened
-    is_training: Toggle between training and inference (affects batch normalization behaviour)
+    bn_state: Current batch normalization layers' state.
+    x: Input data [BS x 28 x 28 x 1] in NHWC format or [BS x 784] flattened.
+    is_training: Toggle between training and inference (affects batch normalization behaviour).
+    momentum: Momentum for updating running statistics (only used in training mode).
 
   Returns:
-    Tuple of (Output logits [BS x 10], Updated parameters)
+    Tuple of (output logits [BS x 10], batch normalization state)
   """
-  # copy of parameters to update with running batch norm stats during training
-  new_params = dict(params) if is_training else params
-
   # reshape input if it's flat [BS x 784]
   if x.ndim == 2:
     x = x.reshape(-1, 28, 28, 1)
 
+  # variables to store updated batchnorm stats if training
+  new_mean1, new_var1 = None, None
+  new_mean2, new_var2 = None, None
+
   # first convolution: [BS x 28 x 28 x 1] -> # [BS x 24 x 24 x 32]
-  conv1_w, conv1_b = params["conv1"]
+  conv1_w, conv1_b = params.conv1
   x = jax.nn.relu(
     (
       jax.lax.conv_general_dilated(
@@ -150,12 +172,12 @@ def forward(
         padding="VALID",
         dimension_numbers=("NHWC", "OIHW", "NHWC"),
       )
-      + jnp.reshape(conv1_b, (1, 1, 1, -1))
+      + jnp.reshape(conv1_b, (1, 1, 1, -1))  # reshaping for broadcasting
     )
   )
 
   # second convolution: [BS x 24 x 24 x 32] -> [BS x 20 x 20 x 32]
-  conv2_w, conv2_b = params["conv2"]
+  conv2_w, conv2_b = params.conv2
   x = jax.nn.relu(
     (
       jax.lax.conv_general_dilated(
@@ -170,28 +192,28 @@ def forward(
   )
 
   # first batch normalization: [BS x 20 x 20 x 32]
-  gamma1, beta1, mean1, var1 = params["bn1"]
+  gamma1, beta1 = params.bn1
   if is_training:
     # compute batch stats
-    batch_mean = jnp.mean(x, axis=(0, 1, 2))
-    batch_var = jnp.var(x, axis=(0, 1, 2))
-
-    # update running stats with momentum
-    momentum = 0.9
-    new_mean1 = momentum * mean1 + (1 - momentum) * batch_mean
-    new_var1 = momentum * var1 + (1 - momentum) * batch_var
-
-    # update parameters with new running stats
-    new_params["bn1"] = (gamma1, beta1, new_mean1, new_var1)
+    batch_mean1 = jnp.mean(x, axis=(0, 1, 2))
+    batch_var1 = jnp.var(x, axis=(0, 1, 2))
 
     # normalize using batch stats
-    batch_mean = batch_mean[None, None, None, :]
-    batch_var = batch_var[None, None, None, :]
-    x = (x - batch_mean) / jnp.sqrt(batch_var + 1e-5)
-  else:  # use stored running stats for inference
-    x = (x - mean1[None, None, None, :]) / jnp.sqrt(var1[None, None, None, :] + 1e-5)
+    x = (x - jnp.reshape(batch_mean1, (1, 1, 1, -1))) / jnp.sqrt(
+      jnp.reshape(batch_var1, (1, 1, 1, -1)) + 1e-5
+    )
+
+    # update running stats
+    new_mean1 = momentum * bn_state.mean1 + (1 - momentum) * batch_mean1
+    new_var1 = momentum * bn_state.var1 + (1 - momentum) * batch_var1
+
+  else:
+    # normalize using running stats
+    x = (x - jnp.reshape(bn_state.mean1, (1, 1, 1, -1))) / jnp.sqrt(
+      jnp.reshape(bn_state.var1, (1, 1, 1, -1)) + 1e-5
+    )
   # apply scale and shift
-  x = gamma1[None, None, None, :] * x + beta1[None, None, None, :]
+  x = jnp.reshape(gamma1, (1, 1, 1, -1)) * x + jnp.reshape(beta1, (1, 1, 1, -1))
 
   # maxpool: [BS x 20 x 20 x 32] -> [BS x 10 x 10 x 32]
   x = jax.lax.reduce_window(
@@ -204,7 +226,7 @@ def forward(
   )
 
   # third convolution: [BS x 10 x 10 x 32] -> [BS x 8 x 8 x 64]
-  conv3_w, conv3_b = params["conv3"]
+  conv3_w, conv3_b = params.conv3
   x = jax.nn.relu(
     (
       jax.lax.conv_general_dilated(
@@ -214,12 +236,12 @@ def forward(
         padding="VALID",
         dimension_numbers=("NHWC", "OIHW", "NHWC"),
       )
-      + conv3_b[None, None, None, :]
+      + jnp.reshape(conv3_b, (1, 1, 1, -1))
     )
   )
 
   # fourth convolution: [BS x 8 x 8 x 64] -> [BS x 6 x 6 x 64]
-  conv4_w, conv4_b = params["conv4"]
+  conv4_w, conv4_b = params.conv4
   x = jax.nn.relu(
     jax.lax.conv_general_dilated(
       lhs=x,
@@ -228,32 +250,31 @@ def forward(
       padding="VALID",
       dimension_numbers=("NHWC", "OIHW", "NHWC"),
     )
-    + conv4_b[None, None, None, :]
+    + jnp.reshape(conv4_b, (1, 1, 1, -1))
   )
 
   # second batch normalization: [BS x 6 x 6 x 64]
-  gamma2, beta2, mean2, var2 = params["bn2"]
+  gamma2, beta2 = params.bn2
   if is_training:
     # compute batch stats and update running stats
-    batch_mean = jnp.mean(x, axis=(0, 1, 2))
-    batch_var = jnp.var(x, axis=(0, 1, 2))
-
-    # update running stats with momentum
-    momentum = 0.9
-    new_mean2 = momentum * mean2 + (1 - momentum) * batch_mean
-    new_var2 = momentum * var2 + (1 - momentum) * batch_var
-
-    # update parameters with new running stats
-    new_params["bn2"] = (gamma2, beta2, new_mean2, new_var2)
+    batch_mean2 = jnp.mean(x, axis=(0, 1, 2))
+    batch_var2 = jnp.var(x, axis=(0, 1, 2))
 
     # normalize using batch stats
-    batch_mean = batch_mean[None, None, None, :]
-    batch_var = batch_var[None, None, None, :]
-    x = (x - batch_mean) / jnp.sqrt(batch_var + 1e-5)
+    x = (x - jnp.reshape(batch_mean2, (1, 1, 1, -1))) / jnp.sqrt(
+      jnp.reshape(batch_var2, (1, 1, 1, -1)) + 1e-5
+    )
+
+    # update running stats with momentum
+    new_mean2 = momentum * bn_state.mean2 + (1 - momentum) * batch_mean2
+    new_var2 = momentum * bn_state.var2 + (1 - momentum) * batch_var2
+
   else:  # use stored running stats for inference
-    x = (x - mean2[None, None, None, :]) / jnp.sqrt(var2[None, None, None, :] + 1e-5)
+    x = (x - jnp.reshape(bn_state.mean2, (1, 1, 1, -1))) / jnp.sqrt(
+      jnp.reshape(bn_state.var2, (1, 1, 1, -1)) + 1e-5
+    )
   # apply scale and shift
-  x = gamma2[None, None, None, :] * x + beta2[None, None, None, :]
+  x = jnp.reshape(gamma2, (1, 1, 1, -1)) * x + jnp.reshape(beta2, (1, 1, 1, -1))
 
   # maxpool: [BS x 6 x 6 x 64] -> [BS x 3 x 3 x 64]
   x = jax.lax.reduce_window(
@@ -270,9 +291,18 @@ def forward(
 
   # fully connected: [BS x 576] -> [BS x 10]
   fc_w, fc_b = params["fc"]
-  x = jnp.dot(x, fc_w.T) + fc_b
+  logits = jnp.dot(x, fc_w.T) + fc_b
 
-  return x, new_params
+  if is_training:
+    new_bn_state = BatchNormState(
+      mean1=new_mean1,
+      var1=new_var1,
+      mean2=new_mean2,
+      var2=new_var2,
+    )
+    return logits, new_bn_state
+
+  return logits, bn_state
 
 
 @jit
