@@ -67,25 +67,6 @@ def accuracy(
 
 
 @jit
-def update(
-  params: List[Tuple[jax.Array, jax.Array]],
-  x: jax.Array,
-  y_onehot: jax.Array,
-  lr: float,
-) -> List[Tuple[jax.Array, jax.Array]]:
-  """
-  Perform one SGD update step.
-  """
-  grads = jax.grad(loss)(params, x, y_onehot)
-  updated_params = []
-  for (W, b), (dW, db) in zip(params, grads):
-    W_updated = W - lr * dW
-    b_updated = b - lr * db
-    updated_params.append((W_updated, b_updated))
-  return updated_params
-
-
-@jit
 def train_step(
   params: List[Tuple[jax.Array, jax.Array]], x: jax.Array, y: jax.Array, lr: float
 ) -> Tuple[jax.Array, jax.Array]:
